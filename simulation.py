@@ -2,19 +2,19 @@
 """Discrete delayed-plant controller design, stability checks, and figures."""
 
 from __future__ import annotations
-from scipy import signal
-import numpy as np
-import matplotlib.pyplot as plt
-
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
 import control
 import cvxpy as cp
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy import signal
 
 
 ROOT = Path(__file__).resolve().parent
@@ -126,7 +126,12 @@ def controller_coefficients(kind: str, gains: Gains) -> tuple[float, float, floa
 def characteristic_polynomial(
     plant: Plant, kind: str, gains: Gains, delay: int
 ) -> np.ndarray:
-    """Return descending powers of z for the reduced closed-loop polynomial."""
+    """Return the coefficients to pass directly to ``np.roots``.
+
+    The polynomial routines here store coefficients in ascending powers of
+    z^-1. After multiplying by the highest power of z, this same sequence is
+    descending powers of z, which is the ordering expected by ``np.roots``.
+    """
     if delay < 0:
         raise ValueError("Transport delay must be nonnegative")
     denominator = plant.denominator_z_inverse
@@ -144,6 +149,36 @@ def characteristic_polynomial(
         np.zeros(delay), np.polynomial.polynomial.polymul(numerator, q)
     ]
     return np.polynomial.polynomial.polyadd(closed_loop, open_loop_numerator)
+
+
+def schur_cohn_test(coefficients: np.ndarray) -> dict[str, Any]:
+    """Apply the real Schur-Cohn recursion and return its reflection ratios."""
+    reduced = np.asarray(coefficients, dtype=float).copy()
+    if reduced.ndim != 1 or len(reduced) < 2 or reduced[0] == 0.0:
+        raise ValueError("Schur-Cohn test requires a nonconstant polynomial")
+    reduced /= reduced[0]
+    steps: list[dict[str, float | int | bool]] = []
+    while len(reduced) > 1:
+        degree = len(reduced) - 1
+        reflection = float(reduced[-1])
+        step_stable = abs(reflection) < 1.0
+        steps.append(
+            {
+                "degree": degree,
+                "reflection_coefficient": reflection,
+                "absolute_reflection_coefficient": abs(reflection),
+                "stable": step_stable,
+            }
+        )
+        if not step_stable:
+            break
+        next_polynomial = reduced - reflection * reduced[::-1]
+        reduced = next_polynomial[:-1]
+        reduced /= reduced[0]
+    return {
+        "stable": all(bool(step["stable"]) for step in steps),
+        "steps": steps,
+    }
 
 
 def closed_loop_poles(
@@ -241,13 +276,16 @@ def simulate_step(
     output = np.zeros(steps)
     for index in range(steps):
         error = 1.0 - float((plant.cd @ x + plant.dd @ np.zeros((1,))).item())
-        previous_controller_input = delayed_inputs[0] if delay else previous_input
-        input_now = (
-            previous_controller_input
-            + q0 * error
-            + q1 * error_1
-            + q2 * error_2
-        )
+        if kind == "P":
+            input_now = gains.kp * error
+        else:
+            previous_controller_input = delayed_inputs[0] if delay else previous_input
+            input_now = (
+                previous_controller_input
+                + q0 * error
+                + q1 * error_1
+                + q2 * error_2
+            )
         output[index] = float((plant.cd @ x).item())
 
         if delay == 0:
@@ -369,6 +407,8 @@ def run() -> dict[str, Any]:
         },
         "controllers": {},
         "lmi_n5_pid": {},
+        "lmi_pid_by_delay": {},
+        "pole_realization_checks": {},
     }
     all_poles: dict[str, dict[str, np.ndarray]] = {}
     for delay in DELAYS:
@@ -383,6 +423,14 @@ def run() -> dict[str, Any]:
                     f"{kind} controller is unstable at N={delay}: "
                     f"maximum pole radius={maximum_radius:.8f}"
                 )
+            polynomial_coefficients = characteristic_polynomial(
+                plant, kind, gains, delay
+            )
+            schur_result = schur_cohn_test(polynomial_coefficients)
+            if not schur_result["stable"]:
+                raise RuntimeError(
+                    f"{kind} controller failed the Schur-Cohn test at N={delay}"
+                )
             time, output = simulate_step(plant, kind, gains, delay)
             metrics = response_metrics(time, output)
             all_poles[str(delay)][kind] = poles
@@ -392,6 +440,7 @@ def run() -> dict[str, Any]:
                 "poles": complex_list(poles),
                 "maximum_pole_radius": maximum_radius,
                 "pole_radius_margin": 1.0 - maximum_radius,
+                "schur_cohn": schur_result,
                 **metrics,
             }
         summary["controllers"][str(delay)] = delay_entries
@@ -409,23 +458,41 @@ def run() -> dict[str, Any]:
         raise RuntimeError(
             "The fixed-gain PID reference is unstable for one or more delays")
 
-    pid_n5 = GAIN_SCHEDULE["PID"][5]
-    augmented = augmented_closed_loop_matrix(plant, pid_n5, delay=5)
-    augmented_eigenvalues = np.linalg.eigvals(augmented)
-    summary["lmi_n5_pid"] = solve_lyapunov_lmi(augmented)
-    summary["lmi_n5_pid"]["augmented_matrix_eigenvalues"] = complex_list(
-        augmented_eigenvalues
-    )
-    summary["lmi_n5_pid"]["max_augmented_eigenvalue_magnitude"] = float(
-        np.max(np.abs(augmented_eigenvalues))
-    )
-    if not np.allclose(
-        np.sort_complex(augmented_eigenvalues),
-        np.sort_complex(all_poles["5"]["PID"]),
-        atol=1e-7,
-    ):
-        raise RuntimeError(
-            "Augmented-matrix eigenvalues do not match the PID polynomial poles")
+    for delay in DELAYS:
+        augmented = augmented_closed_loop_matrix(
+            plant, GAIN_SCHEDULE["PID"][delay], delay
+        )
+        augmented_eigenvalues = np.linalg.eigvals(augmented)
+        polynomial_poles = all_poles[str(delay)]["PID"]
+        realization_matches = len(augmented_eigenvalues) == len(polynomial_poles) and np.allclose(
+            np.sort_complex(augmented_eigenvalues),
+            np.sort_complex(polynomial_poles),
+            atol=1e-7,
+        )
+        if not realization_matches:
+            raise RuntimeError(
+                f"Augmented-matrix eigenvalues do not match PID polynomial poles at N={delay}"
+            )
+        summary["pole_realization_checks"][str(delay)] = True
+        lmi_result = solve_lyapunov_lmi(augmented)
+        lmi_result["augmented_matrix_eigenvalues"] = complex_list(
+            augmented_eigenvalues
+        )
+        lmi_result["max_augmented_eigenvalue_magnitude"] = float(
+            np.max(np.abs(augmented_eigenvalues))
+        )
+        summary["lmi_pid_by_delay"][str(delay)] = lmi_result
+    summary["lmi_n5_pid"] = summary["lmi_pid_by_delay"]["5"]
+
+    fixed_pid_n5_poles = fixed_poles["5"]
+    fixed_time, fixed_output = simulate_step(plant, "PID", fixed_pid, delay=5)
+    summary["fixed_pid_at_n5"] = {
+        "gains": asdict(fixed_pid),
+        "poles": complex_list(fixed_pid_n5_poles),
+        "maximum_pole_radius": float(np.max(np.abs(fixed_pid_n5_poles))),
+        "pole_radius_margin": float(1.0 - np.max(np.abs(fixed_pid_n5_poles))),
+        **response_metrics(fixed_time, fixed_output),
+    }
 
     plot_step_comparison(plant)
     plot_delay_sweep(plant)
