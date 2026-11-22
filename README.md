@@ -64,7 +64,7 @@ The resulting delay-regime gain schedule is a lookup table, selected using the k
 | 4 | (2.7042, 0, 0) | (0, 0.2536, 0) | (1.1283, 0.5149, 0) | (2.1528, 1.0661, 1.2817) |
 | 5 | (2.4468, 0, 0) | (0, 0.2427, 0) | (1.0595, 0.4710, 0) | (1.8498, 0.9094, 1.1410) |
 
-`controller.py` implements the stateful control law independently of the plant; `simulation.py` performs tuning, analysis and comparison. Create the locked environment with `uv sync`, then reproduce the results and figures with `uv run python simulation.py`.
+`controller.py` implements the stateful control law independently of the plant; `simulation.py` performs tuning, analysis and comparison. Install `uv`, Pandoc and XeLaTeX, then run `make` to regenerate the simulation results, figures and `delayed-control-project.pdf`. Run `make simulate` for the simulations alone, or `make pdf` to regenerate the simulations and compile the PDF.
 
 ## 3. Theoretical Stability Proof
 
