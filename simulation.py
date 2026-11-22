@@ -14,7 +14,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy import signal
+from scipy import optimize, signal
+
+from controller import DiscreteController, Gains
 
 
 ROOT = Path(__file__).resolve().parent
@@ -24,17 +26,33 @@ TS = 0.1
 DELAYS = tuple(range(1, 6))
 PLOT_HORIZON_SECONDS = 40.0
 SIMULATION_STEPS = int(PLOT_HORIZON_SECONDS / TS)
-
-
-@dataclass(frozen=True)
-class Gains:
-    kp: float = 0.0
-    ki: float = 0.0
-    kd: float = 0.0
+PLANT_TIME_CONSTANT = 1.0
+CONTROLLER_KINDS = ("P", "I", "PI", "PID")
+COMPARISON_DELAY = 5
+FIXED_GAIN_DELAY = 1
+TUNING_HORIZON_SECONDS = 20.0
+TUNING_STEPS = int(TUNING_HORIZON_SECONDS / TS)
+GAIN_BOUNDS = {"kp": (0.05, 4.0), "ki": (0.01, 2.0), "kd": (0.01, 2.0)}
+ACTIVE_GAINS = {"P": ("kp",), "I": ("ki",), "PI": ("kp", "ki"), "PID": ("kp", "ki", "kd")}
+MAX_TUNING_POLE_RADIUS = 0.99
+OVERSHOOT_WEIGHT = 20.0
+TUNING_SEED = 42
+TUNING_MAXITER = 150
+TUNING_POPSIZE = 10
+TUNING_TOLERANCE = 1e-6
+TUNING_FAILURE_PENALTY = 1e4
+SETTLING_BAND = 0.02
+PLOT_DPI = 300
+LMI_TOLERANCE = 1e-10
+LMI_MAXITER = 500
+EIGENVALUE_ATOL = 1e-7
+EIGENVALUE_RTOL = 1e-7
 
 
 @dataclass
 class Plant:
+    """Discrete plant realization and transfer-function coefficients."""
+
     ad: np.ndarray
     bd: np.ndarray
     cd: np.ndarray
@@ -43,42 +61,10 @@ class Plant:
     denominator_z_inverse: np.ndarray
 
 
-GAIN_SCHEDULE: dict[str, dict[int, Gains]] = {
-    "P": {
-        1: Gains(kp=0.8),
-        2: Gains(kp=0.7),
-        3: Gains(kp=0.6),
-        4: Gains(kp=0.5),
-        5: Gains(kp=0.4),
-    },
-    "I": {
-        1: Gains(ki=0.50),
-        2: Gains(ki=0.42),
-        3: Gains(ki=0.35),
-        4: Gains(ki=0.28),
-        5: Gains(ki=0.22),
-    },
-    "PI": {
-        1: Gains(kp=0.80, ki=0.50),
-        2: Gains(kp=0.75, ki=0.48),
-        3: Gains(kp=0.70, ki=0.46),
-        4: Gains(kp=0.65, ki=0.43),
-        5: Gains(kp=0.60, ki=0.40),
-    },
-    "PID": {
-        1: Gains(kp=1.10, ki=0.65, kd=0.12),
-        2: Gains(kp=1.00, ki=0.60, kd=0.11),
-        3: Gains(kp=0.90, ki=0.55, kd=0.10),
-        4: Gains(kp=0.80, ki=0.50, kd=0.09),
-        5: Gains(kp=0.70, ki=0.45, kd=0.08),
-    },
-}
-
-
 def define_plant() -> Plant:
     """ZOH-discretize Gc(s)=1/(s+1)^2 and retain its state-space realization."""
-    ac = np.array([[0.0, 1.0], [-1.0, -2.0]])
-    bc = np.array([[0.0], [1.0]])
+    ac = np.array([[0.0, 1.0], [-1.0 / PLANT_TIME_CONSTANT**2, -2.0 / PLANT_TIME_CONSTANT]])
+    bc = np.array([[0.0], [1.0 / PLANT_TIME_CONSTANT**2]])
     cc = np.array([[1.0, 0.0]])
     dc = np.zeros((1, 1))
     ad, bd, cd, dd, _ = signal.cont2discrete(
@@ -102,27 +88,6 @@ def define_plant() -> Plant:
     )
 
 
-def controller_coefficients(kind: str, gains: Gains) -> tuple[float, float, float]:
-    """Return q0,q1,q2 for the incremental-controller representation."""
-    if kind == "P":
-        return gains.kp, -gains.kp, 0.0
-    if kind == "I":
-        return gains.ki * TS, 0.0, 0.0
-    if kind == "PI":
-        return (
-            gains.kp + gains.ki * TS / 2.0,
-            -gains.kp + gains.ki * TS / 2.0,
-            0.0,
-        )
-    if kind == "PID":
-        return (
-            gains.kp + gains.ki * TS / 2.0 + gains.kd / TS,
-            -gains.kp + gains.ki * TS / 2.0 - 2.0 * gains.kd / TS,
-            gains.kd / TS,
-        )
-    raise ValueError(f"Unknown controller structure: {kind}")
-
-
 def characteristic_polynomial(
     plant: Plant, kind: str, gains: Gains, delay: int
 ) -> np.ndarray:
@@ -140,7 +105,7 @@ def characteristic_polynomial(
         open_loop_numerator = np.r_[np.zeros(delay), numerator * gains.kp]
         return np.polynomial.polynomial.polyadd(denominator, open_loop_numerator)
 
-    q = np.asarray(controller_coefficients(kind, gains))
+    q = np.asarray(DiscreteController(kind, gains, TS).coefficients)
     controller_denominator = np.array([1.0, -1.0])
     closed_loop = np.polynomial.polynomial.polymul(
         denominator, controller_denominator
@@ -184,8 +149,59 @@ def schur_cohn_test(coefficients: np.ndarray) -> dict[str, Any]:
 def closed_loop_poles(
     plant: Plant, kind: str, gains: Gains, delay: int
 ) -> np.ndarray:
+    """Calculate closed-loop poles from the characteristic polynomial."""
     coefficients = characteristic_polynomial(plant, kind, gains, delay)
     return np.roots(coefficients)
+
+
+def tune_gains(plant: Plant, kind: str, delay: int) -> Gains:
+    """Optimize step tracking and overshoot under a closed-loop pole bound."""
+    names = ACTIVE_GAINS[kind]
+    bounds = [GAIN_BOUNDS[name] for name in names]
+    # The N=1 PID also serves as a fixed-gain baseline for every delay.
+    checked_delays = DELAYS if kind == "PID" and delay == FIXED_GAIN_DELAY else (delay,)
+
+    def objective(values: np.ndarray) -> float:
+        """Score one gain vector, penalizing violation of the pole-radius bound."""
+        gains = Gains(**dict(zip(names, values)))
+        radii = [np.max(np.abs(closed_loop_poles(plant, kind, gains, n))) for n in checked_delays]
+        largest_radius = float(max(radii))
+        if largest_radius >= MAX_TUNING_POLE_RADIUS:
+            return TUNING_FAILURE_PENALTY * (1.0 + largest_radius - MAX_TUNING_POLE_RADIUS)
+        if kind == "P":
+            controller_num = np.array([gains.kp])
+        else:
+            controller_num = np.array(DiscreteController(kind, gains, TS).coefficients)
+        numerator = np.r_[
+            np.zeros(delay),
+            np.polynomial.polynomial.polymul(plant.numerator_z_inverse, controller_num),
+        ]
+        denominator = characteristic_polynomial(plant, kind, gains, delay)
+        output = signal.lfilter(numerator, denominator, np.ones(TUNING_STEPS))
+        error = 1.0 - output
+        overshoot = max(0.0, float(np.max(output)) - 1.0)
+        return float(TS * np.sum(np.abs(error)) + OVERSHOOT_WEIGHT * overshoot**2)
+
+    result = optimize.differential_evolution(
+        objective,
+        bounds,
+        seed=TUNING_SEED,
+        maxiter=TUNING_MAXITER,
+        popsize=TUNING_POPSIZE,
+        tol=TUNING_TOLERANCE,
+        polish=True,
+    )
+    if not result.success or result.fun >= TUNING_FAILURE_PENALTY:
+        raise RuntimeError(f"Tuning {kind} at N={delay} failed: {result.message}")
+    return Gains(**dict(zip(names, (float(value) for value in result.x))))
+
+
+def build_gain_schedule(plant: Plant) -> dict[str, dict[int, Gains]]:
+    """Calculate controller gains independently for each delay regime."""
+    return {
+        kind: {delay: tune_gains(plant, kind, delay) for delay in DELAYS}
+        for kind in CONTROLLER_KINDS
+    }
 
 
 def augmented_closed_loop_matrix(
@@ -194,7 +210,7 @@ def augmented_closed_loop_matrix(
     """Build the zero-reference closed-loop matrix including the input delay line."""
     if delay < 1:
         raise ValueError("The augmented delay model requires delay >= 1")
-    q0, q1, q2 = controller_coefficients("PID", gains)
+    q0, q1, q2 = DiscreteController("PID", gains, TS).coefficients
     state_size = plant.ad.shape[0] + delay + 2
     queue_start = plant.ad.shape[0]
     queue_end = queue_start + delay
@@ -202,6 +218,7 @@ def augmented_closed_loop_matrix(
     error_2_index = queue_end + 1
 
     def transition(state: np.ndarray) -> np.ndarray:
+        """Advance the augmented zero-reference state by one sample."""
         x = state[: plant.ad.shape[0]]
         delayed_inputs = state[queue_start:queue_end]
         error_1 = state[error_1_index]
@@ -234,10 +251,10 @@ def solve_lyapunov_lmi(matrix: np.ndarray) -> dict[str, Any]:
     problem.solve(
         solver=cp.CLARABEL,
         verbose=False,
-        tol_gap_abs=1e-10,
-        tol_feas=1e-10,
-        tol_gap_rel=1e-10,
-        max_iter=500,
+        tol_gap_abs=LMI_TOLERANCE,
+        tol_feas=LMI_TOLERANCE,
+        tol_gap_rel=LMI_TOLERANCE,
+        max_iter=LMI_MAXITER,
     )
     if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or p.value is None:
         raise RuntimeError(f"Lyapunov LMI was not feasible: {problem.status}")
@@ -269,23 +286,11 @@ def simulate_step(
     """Simulate a unit reference step from a zero state, with no saturation."""
     x = np.zeros(plant.ad.shape[0])
     delayed_inputs = np.zeros(delay)
-    previous_input = 0.0
-    error_1 = 0.0
-    error_2 = 0.0
-    q0, q1, q2 = controller_coefficients(kind, gains)
+    controller = DiscreteController(kind, gains, TS)
     output = np.zeros(steps)
     for index in range(steps):
         error = 1.0 - float((plant.cd @ x + plant.dd @ np.zeros((1,))).item())
-        if kind == "P":
-            input_now = gains.kp * error
-        else:
-            previous_controller_input = delayed_inputs[0] if delay else previous_input
-            input_now = (
-                previous_controller_input
-                + q0 * error
-                + q1 * error_1
-                + q2 * error_2
-            )
+        input_now = controller.update(error)
         output[index] = float((plant.cd @ x).item())
 
         if delay == 0:
@@ -293,14 +298,13 @@ def simulate_step(
         else:
             x = plant.ad @ x + plant.bd[:, 0] * delayed_inputs[-1]
             delayed_inputs = np.r_[input_now, delayed_inputs[:-1]]
-        previous_input = input_now
-        error_2, error_1 = error_1, error
     return np.arange(steps) * TS, output
 
 
 def response_metrics(time: np.ndarray, output: np.ndarray) -> dict[str, float | None]:
+    """Measure reference-relative overshoot, settling time and final error."""
     final_error = float(abs(1.0 - output[-1]))
-    within_band = np.abs(output - 1.0) <= 0.02
+    within_band = np.abs(output - 1.0) <= SETTLING_BAND
     settling_index: int | None = None
     for index in range(len(output)):
         if np.all(within_band[index:]):
@@ -315,40 +319,42 @@ def response_metrics(time: np.ndarray, output: np.ndarray) -> dict[str, float | 
     }
 
 
-def plot_step_comparison(plant: Plant) -> None:
+def plot_step_comparison(plant: Plant, schedule: dict[str, dict[int, Gains]]) -> None:
+    """Plot all scheduled controller step responses at the comparison delay."""
     fig, axis = plt.subplots(figsize=(8.5, 5.2))
-    for kind in ("P", "I", "PI", "PID"):
-        gains = GAIN_SCHEDULE[kind][5]
-        time, output = simulate_step(plant, kind, gains, delay=5)
+    for kind in CONTROLLER_KINDS:
+        gains = schedule[kind][COMPARISON_DELAY]
+        time, output = simulate_step(plant, kind, gains, delay=COMPARISON_DELAY)
         axis.plot(time, output, label=kind, linewidth=1.8)
     axis.axhline(1.0, color="black", linewidth=0.8,
                  linestyle="--", label="reference")
-    axis.set(title="Unit-step response at delay N=5",
+    axis.set(title=f"Unit-step response at delay N={COMPARISON_DELAY}",
              xlabel="Time (s)", ylabel="Output")
     axis.grid(True, alpha=0.3)
     axis.legend()
     fig.tight_layout()
-    fig.savefig(ASSETS / "fig_step_comparison.png", dpi=300)
+    fig.savefig(ASSETS / "fig_step_comparison.png", dpi=PLOT_DPI)
     plt.close(fig)
 
 
-def plot_delay_sweep(plant: Plant) -> None:
+def plot_delay_sweep(plant: Plant, schedule: dict[str, dict[int, Gains]]) -> None:
+    """Plot scheduled PID responses and the fixed-gain baseline."""
     fig, axis = plt.subplots(figsize=(8.5, 5.2))
     colors = plt.cm.viridis(np.linspace(0.08, 0.92, len(DELAYS)))
     for delay, color in zip(DELAYS, colors):
         time, output = simulate_step(
-            plant, "PID", GAIN_SCHEDULE["PID"][delay], delay=delay
+            plant, "PID", schedule["PID"][delay], delay=delay
         )
         axis.plot(time, output, color=color, label=f"scheduled PID, N={delay}")
-    fixed_gains = GAIN_SCHEDULE["PID"][1]
-    time, output = simulate_step(plant, "PID", fixed_gains, delay=5)
+    fixed_gains = schedule["PID"][FIXED_GAIN_DELAY]
+    time, output = simulate_step(plant, "PID", fixed_gains, delay=COMPARISON_DELAY)
     axis.plot(
         time,
         output,
         color="black",
         linestyle="--",
         linewidth=1.5,
-        label="fixed PID, N=5",
+        label=f"fixed PID, N={COMPARISON_DELAY}",
     )
     axis.axhline(1.0, color="gray", linewidth=0.8, linestyle=":")
     axis.set(title="Discrete PID response under transport delay",
@@ -356,11 +362,12 @@ def plot_delay_sweep(plant: Plant) -> None:
     axis.grid(True, alpha=0.3)
     axis.legend(ncol=2, fontsize=8)
     fig.tight_layout()
-    fig.savefig(ASSETS / "fig_delay_sweep.png", dpi=300)
+    fig.savefig(ASSETS / "fig_delay_sweep.png", dpi=PLOT_DPI)
     plt.close(fig)
 
 
 def plot_pole_migration(pole_data: dict[str, dict[str, np.ndarray]]) -> None:
+    """Plot scheduled PID poles against the unit circle for each delay."""
     fig, axis = plt.subplots(figsize=(6.5, 6.0))
     circle = plt.Circle((0.0, 0.0), 1.0, color="black",
                         fill=False, linestyle="--")
@@ -383,11 +390,12 @@ def plot_pole_migration(pole_data: dict[str, dict[str, np.ndarray]]) -> None:
     axis.grid(True, alpha=0.25)
     axis.legend()
     fig.tight_layout()
-    fig.savefig(ASSETS / "fig_zplane_poles.png", dpi=300)
+    fig.savefig(ASSETS / "fig_zplane_poles.png", dpi=PLOT_DPI)
     plt.close(fig)
 
 
 def complex_list(values: np.ndarray) -> list[dict[str, float]]:
+    """Convert complex values into JSON-compatible real/imaginary pairs."""
     return [
         {"real": float(value.real), "imag": float(value.imag)}
         for value in values
@@ -395,27 +403,40 @@ def complex_list(values: np.ndarray) -> list[dict[str, float]]:
 
 
 def run() -> dict[str, Any]:
+    """Tune, verify and simulate all controllers, and export the results."""
     ASSETS.mkdir(parents=True, exist_ok=True)
     plant = define_plant()
+    schedule = build_gain_schedule(plant)
     summary: dict[str, Any] = {
         "plant": {
-            "continuous_transfer_function": "1/(s+1)^2",
+            "continuous_transfer_function": f"1/({PLANT_TIME_CONSTANT}*s+1)^2",
             "sample_period_s": TS,
             "discrete_numerator_z_inverse": plant.numerator_z_inverse.tolist(),
             "discrete_denominator_z_inverse": plant.denominator_z_inverse.tolist(),
             "delay_operator": "z^(-N)",
         },
         "controllers": {},
-        "lmi_n5_pid": {},
         "lmi_pid_by_delay": {},
         "pole_realization_checks": {},
+        "tuning": {
+            "method": "scipy.optimize.differential_evolution",
+            "gain_bounds": GAIN_BOUNDS,
+            "max_pole_radius": MAX_TUNING_POLE_RADIUS,
+            "horizon_s": TUNING_HORIZON_SECONDS,
+            "overshoot_weight": OVERSHOOT_WEIGHT,
+            "seed": TUNING_SEED,
+            "max_iterations": TUNING_MAXITER,
+            "population_size_multiplier": TUNING_POPSIZE,
+            "tolerance": TUNING_TOLERANCE,
+            "fixed_pid_robust_delays": DELAYS,
+        },
     }
     all_poles: dict[str, dict[str, np.ndarray]] = {}
     for delay in DELAYS:
         delay_entries: dict[str, Any] = {}
         all_poles[str(delay)] = {}
-        for kind in ("P", "I", "PI", "PID"):
-            gains = GAIN_SCHEDULE[kind][delay]
+        for kind in CONTROLLER_KINDS:
+            gains = schedule[kind][delay]
             poles = closed_loop_poles(plant, kind, gains, delay)
             maximum_radius = float(np.max(np.abs(poles)))
             if not maximum_radius < 1.0:
@@ -436,7 +457,7 @@ def run() -> dict[str, Any]:
             all_poles[str(delay)][kind] = poles
             delay_entries[kind] = {
                 "gains": asdict(gains),
-                "q": list(controller_coefficients(kind, gains)),
+                "q": list(DiscreteController(kind, gains, TS).coefficients),
                 "poles": complex_list(poles),
                 "maximum_pole_radius": maximum_radius,
                 "pole_radius_margin": 1.0 - maximum_radius,
@@ -445,7 +466,7 @@ def run() -> dict[str, Any]:
             }
         summary["controllers"][str(delay)] = delay_entries
 
-    fixed_pid = GAIN_SCHEDULE["PID"][1]
+    fixed_pid = schedule["PID"][FIXED_GAIN_DELAY]
     fixed_poles = {
         str(delay): closed_loop_poles(plant, "PID", fixed_pid, delay)
         for delay in DELAYS
@@ -460,14 +481,15 @@ def run() -> dict[str, Any]:
 
     for delay in DELAYS:
         augmented = augmented_closed_loop_matrix(
-            plant, GAIN_SCHEDULE["PID"][delay], delay
+            plant, schedule["PID"][delay], delay
         )
         augmented_eigenvalues = np.linalg.eigvals(augmented)
         polynomial_poles = all_poles[str(delay)]["PID"]
         realization_matches = len(augmented_eigenvalues) == len(polynomial_poles) and np.allclose(
             np.sort_complex(augmented_eigenvalues),
             np.sort_complex(polynomial_poles),
-            atol=1e-7,
+            atol=EIGENVALUE_ATOL,
+            rtol=EIGENVALUE_RTOL,
         )
         if not realization_matches:
             raise RuntimeError(
@@ -482,31 +504,31 @@ def run() -> dict[str, Any]:
             np.max(np.abs(augmented_eigenvalues))
         )
         summary["lmi_pid_by_delay"][str(delay)] = lmi_result
-    summary["lmi_n5_pid"] = summary["lmi_pid_by_delay"]["5"]
+    comparison_key = str(COMPARISON_DELAY)
+    summary[f"lmi_n{COMPARISON_DELAY}_pid"] = summary["lmi_pid_by_delay"][comparison_key]
 
-    fixed_pid_n5_poles = fixed_poles["5"]
-    fixed_time, fixed_output = simulate_step(plant, "PID", fixed_pid, delay=5)
-    summary["fixed_pid_at_n5"] = {
+    fixed_pid_comparison_poles = fixed_poles[comparison_key]
+    fixed_time, fixed_output = simulate_step(plant, "PID", fixed_pid, delay=COMPARISON_DELAY)
+    summary[f"fixed_pid_at_n{COMPARISON_DELAY}"] = {
         "gains": asdict(fixed_pid),
-        "poles": complex_list(fixed_pid_n5_poles),
-        "maximum_pole_radius": float(np.max(np.abs(fixed_pid_n5_poles))),
-        "pole_radius_margin": float(1.0 - np.max(np.abs(fixed_pid_n5_poles))),
+        "poles": complex_list(fixed_pid_comparison_poles),
+        "maximum_pole_radius": float(np.max(np.abs(fixed_pid_comparison_poles))),
+        "pole_radius_margin": float(1.0 - np.max(np.abs(fixed_pid_comparison_poles))),
         **response_metrics(fixed_time, fixed_output),
     }
 
-    plot_step_comparison(plant)
-    plot_delay_sweep(plant)
+    plot_step_comparison(plant, schedule)
+    plot_delay_sweep(plant, schedule)
     plot_pole_migration(all_poles)
     RESULTS_PATH.write_text(json.dumps(
         summary, indent=2) + "\n", encoding="utf-8")
+    lmi = summary[f"lmi_n{COMPARISON_DELAY}_pid"]
     print(
-        f"LMI N=5 PID: {summary['lmi_n5_pid']['status']} "
-        f"(min eig(P)={summary['lmi_n5_pid']['min_eigenvalue_P']:.3e}, "
-        "max eig(A'PA-P)="
-        f"{summary['lmi_n5_pid']
-            ['max_eigenvalue_A_transpose_P_A_minus_P']:.3e})"
+        f"LMI N={COMPARISON_DELAY} PID: {lmi['status']} "
+        f"(min eig(P)={lmi['min_eigenvalue_P']:.3e}, "
+        f"max eig(A'PA-P)={lmi['max_eigenvalue_A_transpose_P_A_minus_P']:.3e})"
     )
-    print(f"All scheduled controller poles are strictly inside the unit circle for N=1..5.")
+    print(f"All scheduled controller poles are strictly inside the unit circle for N={DELAYS}.")
     print(f"Wrote {RESULTS_PATH} and three figures under {ASSETS}/")
     return summary
 

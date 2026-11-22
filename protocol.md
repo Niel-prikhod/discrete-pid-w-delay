@@ -43,15 +43,28 @@ Its transfer function is $G_R(z)=(q_0+q_1z^{-1}+q_2z^{-2})/(1-z^{-1})$. With $T_
 
 These are respectively direct proportional action, rectangular-sum integration, trapezoidal PI integration, and trapezoidal PI plus backward-difference derivative action. The simulation applies the P law directly as $u(k)=K_pe(k)$; its listed $(q_0,q_1,q_2)$ only express the equivalent incremental relation when the previous command and error states are consistent. The characteristic polynomial is reduced to the direct $K_p$ form, avoiding a canceled pole at $z=1$ and a redundant integrator state.
 
-The delay-regime gain schedule is a lookup table, selected using the known/estimated integer delay. The delay estimate is assumed available before tuning the loop; there is no interpolation or online gain adaptation between rows. Gains are tapered with increasing delay to reduce loop aggressiveness; entries are $(K_p,K_i,K_d)$, with unused gains set to zero.
+### Numerical tuning and gain scheduling
+
+The gains are calculated offline, separately for each controller structure and integer delay, by `scipy.optimize.differential_evolution` with seed 42, population multiplier 10, tolerance $10^{-6}$ and a limit of 150 iterations, followed by local polishing. The optimizer varies only the gains applicable to the structure, within $0.05\leq K_p\leq4$, $0.01\leq K_i\leq2$, and $0.01\leq K_d\leq2$. It minimizes the reference-tracking objective
+
+$$
+J=T_s\sum_{k=0}^{199}|1-y(k)|+
+20\left[\max\left(0,\max_{0\leq k<200}y(k)-1\right)\right]^2,
+$$
+
+computed on a 20-second unit-step response. Candidate gains must have maximum closed-loop pole radius below $0.99$; infeasible candidates receive a large penalty. Because the $N=1$ PID also serves as the fixed-gain baseline, its pole constraint is checked at every $N=1,\ldots,5$, while its objective still uses the $N=1$ response. All other candidates are checked at their own delay. The optimization is numerical and bounded; it does not establish a global optimum. It does not penalize control effort, actuator limits, disturbances, or noise, and the unfiltered derivative produces a potentially large initial control command.
+
+The resulting delay-regime gain schedule is a lookup table, selected using the known/estimated integer delay. The delay estimate is assumed available before tuning the loop; there is no interpolation or online gain adaptation between rows. Entries below are rounded $(K_p,K_i,K_d)$; the simulation uses the unrounded optimized values and calculates $(q_0,q_1,q_2)$ from them. Some gains reach the chosen bounds.
 
 | $N$ | P | I | PI | PID |
 |---:|---:|---:|---:|---:|
-| 1 | (0.80, 0, 0) | (0, 0.50, 0) | (0.80, 0.50, 0) | (1.10, 0.65, 0.12) |
-| 2 | (0.70, 0, 0) | (0, 0.42, 0) | (0.75, 0.48, 0) | (1.00, 0.60, 0.11) |
-| 3 | (0.60, 0, 0) | (0, 0.35, 0) | (0.70, 0.46, 0) | (0.90, 0.55, 0.10) |
-| 4 | (0.50, 0, 0) | (0, 0.28, 0) | (0.65, 0.43, 0) | (0.80, 0.50, 0.09) |
-| 5 | (0.40, 0, 0) | (0, 0.22, 0) | (0.60, 0.40, 0) | (0.70, 0.45, 0.08) |
+| 1 | (4.0000, 0, 0) | (0, 0.2949, 0) | (1.7179, 0.7390, 0) | (3.9861, 2.0000, 1.8792) |
+| 2 | (3.5313, 0, 0) | (0, 0.2797, 0) | (1.4614, 0.6428, 0) | (3.2933, 1.6691, 1.8016) |
+| 3 | (3.0137, 0, 0) | (0, 0.2660, 0) | (1.2695, 0.5721, 0) | (2.5806, 1.2867, 1.4630) |
+| 4 | (2.7042, 0, 0) | (0, 0.2536, 0) | (1.1283, 0.5149, 0) | (2.1528, 1.0661, 1.2817) |
+| 5 | (2.4468, 0, 0) | (0, 0.2427, 0) | (1.0595, 0.4710, 0) | (1.8498, 0.9094, 1.1410) |
+
+`controller.py` implements the stateful control law independently of the plant; `simulation.py` performs tuning, analysis and comparison. Create the locked environment with `uv sync`, then reproduce the results and figures with `uv run python simulation.py`.
 
 ## 3. Theoretical Stability Proof
 
@@ -83,20 +96,20 @@ The implementation applies this recursion numerically to every scheduled polynom
 
 | Delay $N$ | P | I | PI | PID |
 |---:|---:|---:|---:|---:|
-| 1 | 0.991118 | 0.998750 | 0.998672 | 0.998338 |
-| 2 | 0.991697 | 0.998953 | 0.998687 | 0.998397 |
-| 3 | 0.992267 | 0.999131 | 0.998713 | 0.998484 |
-| 4 | 0.992811 | 0.999307 | 0.998778 | 0.998595 |
-| 5 | 0.993320 | 0.999457 | 0.998853 | 0.998726 |
+| 1 | 0.976195 | 0.999262 | 0.997887 | 0.996766 |
+| 2 | 0.979515 | 0.999302 | 0.998062 | 0.996905 |
+| 3 | 0.982781 | 0.999338 | 0.998215 | 0.997210 |
+| 4 | 0.984994 | 0.999372 | 0.998356 | 0.997439 |
+| 5 | 0.986789 | 0.999401 | 0.998454 | 0.997641 |
 
 As an explicit $N=5$ recursion trace, the reflection ratios in descending degree order are:
 
 | Controller | $r_m$ values, recursion from highest degree to degree 1 |
 |---|---|
-| P | $0.001751,\ 0.005040,\ 0.007688,\ 0.009786,\ 0.011418,\ 0.831641,\ -0.993320$ |
-| I | $0.000096,\ 0.000373,\ 0.000796,\ 0.001334,\ -0.816771,\ 0.996092,\ -0.999457$ |
-| PI | $-0.002539,\ -0.007133,\ -0.010468,\ -0.012744,\ -0.014133,\ -0.833949,\ 0.994659,\ -0.998853$ |
-| PID | $0.003502,\ 0.003613,\ -0.003045,\ -0.008061,\ -0.011688,\ -0.014147,\ -0.834742,\ 0.994315,\ -0.998726$ |
+| P | $0.010710,\ 0.030833,\ 0.047083,\ 0.060152,\ 0.070713,\ 0.907953,\ -0.986789$ |
+| I | $0.000106,\ 0.000412,\ 0.000879,\ 0.001472,\ -0.816568,\ 0.996202,\ -0.999401$ |
+| PI | $-0.004534,\ -0.012846,\ -0.019113,\ -0.023656,\ -0.026759,\ -0.848893,\ 0.993492,\ -0.998454$ |
+| PID | $0.049942,\ 0.086140,\ 0.054082,\ 0.027771,\ 0.006373,\ -0.010687,\ -0.857175,\ 0.987572,\ -0.997641$ |
 
 All reported ratios have magnitude strictly below one, consistent with the pole-radius results. The polynomial arrays are stored as coefficients in ascending powers of $z^{-1}$; clearing denominators makes this ordering the descending-power coefficient sequence in $z$ expected by `numpy.roots`, so no reversal is applied before finding roots.
 
@@ -104,11 +117,11 @@ All reported ratios have magnitude strictly below one, consistent with the pole-
 
 | Delay $N$ | P | I | PI | PID |
 |---:|---:|---:|---:|---:|
-| 1 | 0.911112 | 0.980304 | 0.953911 | 0.949242 |
-| 2 | 0.914724 | 0.979781 | 0.952209 | 0.948484 |
-| 3 | 0.917583 | 0.979009 | 0.950134 | 0.947520 |
-| 4 | 0.919478 | 0.977654 | 0.949977 | 0.946227 |
-| 5 | 0.920234 | 0.976081 | 0.949847 | 0.946007 |
+| 1 | 0.934931 | 0.974288 | 0.965751 | 0.914454 |
+| 2 | 0.949599 | 0.975071 | 0.965886 | 0.925551 |
+| 3 | 0.958228 | 0.975811 | 0.965844 | 0.930243 |
+| 4 | 0.965433 | 0.976511 | 0.966187 | 0.935530 |
+| 5 | 0.970507 | 0.977195 | 0.967743 | 0.939316 |
 
 The companion summary `results.json` contains each pole, maximum pole radius, and radial stability margin $1-\max_i|z_i|$. The scheduled designs are required by the script to have positive radial margin for every $N=1,\ldots,5$; execution aborts rather than emitting a stability claim if this check fails.
 
@@ -130,17 +143,17 @@ This augmented-delay Lyapunov formulation captures the finite memory of the tran
 
 | $N$ | Matrix dimension | Solver status | $\lambda_{\min}(P)$ | $\lambda_{\max}(A_{\mathrm{aug}}^TPA_{\mathrm{aug}}-P)$ | Maximum augmented pole magnitude |
 |---:|---:|---|---:|---:|---:|
-| 1 | 5 | optimal | $3.6312\times10^{-3}$ | $-3.6309\times10^{-3}$ | 0.949242 |
-| 2 | 6 | optimal | $2.6047\times10^{-3}$ | $-2.6042\times10^{-3}$ | 0.948483 |
-| 3 | 7 | optimal | $2.0832\times10^{-3}$ | $-2.0828\times10^{-3}$ | 0.947520 |
-| 4 | 8 | optimal | $1.7842\times10^{-3}$ | $-1.7838\times10^{-3}$ | 0.946227 |
-| 5 | 9 | optimal | $1.6041\times10^{-3}$ | $-1.6038\times10^{-3}$ | 0.946007 |
+| 1 | 5 | optimal | $1.5330\times10^{-4}$ | $-1.5169\times10^{-4}$ | 0.914454 |
+| 2 | 6 | optimal | $8.1216\times10^{-5}$ | $-7.9806\times10^{-5}$ | 0.925551 |
+| 3 | 7 | optimal | $6.9222\times10^{-5}$ | $-6.8079\times10^{-5}$ | 0.930243 |
+| 4 | 8 | optimal | $5.9109\times10^{-5}$ | $-5.8145\times10^{-5}$ | 0.935530 |
+| 5 | 9 | optimal | $5.2786\times10^{-5}$ | $-5.1953\times10^{-5}$ | 0.939316 |
 
 For every delay, the script also asserts that the eigenvalues of $A_{\mathrm{aug}}$ match the roots of the independently formed characteristic polynomial. The detailed solver results, numerical signs, and eigenvalues are included in `results.json`.
 
 ## 4. Simulation Results
 
-Responses are simulated over $40$ seconds. Overshoot is relative to the unit reference; settling time is the first sample after which the response stays within a $\pm2\%$ band for the remainder of the run. The steady-state error is the absolute final tracking error. The fixed-gain comparison holds the $N=1$ PID gains $(1.10,0.65,0.12)$ at $N=5$, while the scheduled comparison uses the $N=5$ gains $(0.70,0.45,0.08)$.
+Responses are simulated over $40$ seconds. Overshoot is relative to the unit reference; settling time is the first sample after which the response stays within a $\pm2\%$ band for the remainder of the run. The steady-state error is the absolute final tracking error. The fixed-gain comparison holds the $N=1$ PID gains $(3.9861,2.0000,1.8792)$ at $N=5$, while the scheduled comparison uses the $N=5$ gains $(1.8498,0.9094,1.1410)$; these values are rounded.
 
 ![Unit-step response comparing the four controller structures at N=5](assets/fig_step_comparison.png)
 
@@ -152,14 +165,14 @@ Responses are simulated over $40$ seconds. Overshoot is relative to the unit ref
 
 | Controller | Settling time (s) | Overshoot (%) | Steady-state error | Maximum pole radius $|\lambda|_{\max}$ |
 |---|---:|---:|---:|---:|
-| P | Not reached within 40 s | 0.00 | 0.714286 | 0.920234 |
-| I | 17.1 | 6.96 | 0.000051 | 0.976081 |
-| PI | 6.8 | 2.43 | $<10^{-6}$ | 0.949847 |
-| PID | 7.0 | 3.56 | $<10^{-6}$ | 0.946007 |
-| PID, fixed $N=1$ gains | 8.5 | 14.71 | $<10^{-6}$ | 0.953851 |
+| P | Not reached within 40 s | 10.18 | 0.290121 | 0.970507 |
+| I | 16.2 | 9.88 | 0.000101 | 0.977195 |
+| PI | 9.0 | 4.32 | $<10^{-6}$ | 0.967743 |
+| PID | 3.9 | 1.88 | $<10^{-6}$ | 0.939316 |
+| PID, fixed $N=1$ gains | 13.5 | 71.06 | 0.000005 | 0.970701 |
 
 The fixed-gain row uses the same $N=5$ plant and delay as the scheduled PID row, changing only the PID gains. The machine-readable summary includes these fixed-gain metrics, response metrics for every scheduled controller across $N=1,\ldots,5$, Schur-Cohn recursion quantities, augmented-realization checks, and Lyapunov results.
 
 ## 5. Conclusion
 
-For this sampled second-order plant and the stated gain table, the design objective is strict Schur stability across integer delays $N=1,\ldots,5$. The discrete poles and an independent $N=5$ Lyapunov certificate provide complementary checks of asymptotic stability. Integral action removes the proportional controller's steady-state offset; derivative action shapes transient damping, while the lookup schedule reduces gains as transport delay grows. The step and pole plots, together with the generated numerical metrics, show the measured trade-offs for this particular model and tuning rather than claiming delay-independent performance for arbitrary plants.
+For this sampled second-order plant and the computed gain table, the designs are strictly Schur stable across integer delays $N=1,\ldots,5$. The discrete poles and separate fixed-delay Lyapunov certificates provide complementary checks of asymptotic stability; they do not prove stability under arbitrary switching between delays or gains. Integral action removes the proportional controller's steady-state offset. At $N=5$, the scheduled PID's lower overshoot and settling time than the fixed PID demonstrate the effect of this tuning and scheduling on this model, not a general guarantee; the unfiltered derivative and unconstrained control effort limit real-world applicability.
